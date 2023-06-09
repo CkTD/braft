@@ -104,6 +104,9 @@ public:
 
     virtual std::string get_path() { return _path; }
 
+    virtual void set_first_reader() {};
+    virtual bool is_first_reader() {return false;};
+
 private:
     std::string _path;
 };
@@ -179,6 +182,12 @@ public:
         return copier;
     }
 
+    virtual SnapshotCopier* start_to_copy_from(const SnapshotMeta& meta) {
+        // TODO: add test
+        return NULL;
+    }
+
+
     virtual int close(SnapshotCopier* copier) {
         delete copier;
         return 0;
@@ -191,6 +200,8 @@ public:
     virtual butil::Status gc_instance(const std::string& uri) const {
         return butil::Status::OK();
     }
+
+    virtual int close_all() { return 0; }
     
 private:
     std::string _path;
