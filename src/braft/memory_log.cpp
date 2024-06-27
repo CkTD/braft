@@ -21,7 +21,7 @@
 
 namespace braft {
 
-int MemoryLogStorage::init(ConfigurationManager* configuration_manager) {
+int MemoryLogStorage::init(ConfigurationManager* configuration_manager, SnapshotMeta *snapshot_meta) {
     _first_log_index.store(1);
     _last_log_index.store(0);
     return 0;
@@ -83,7 +83,8 @@ int MemoryLogStorage::append_entries(const std::vector<LogEntry*>& entries,
     return entries.size();
 }
 
-int MemoryLogStorage::truncate_prefix(const int64_t first_index_kept) {
+int MemoryLogStorage::truncate_prefix(const SnapshotMeta &snapshot_meta) {
+    int64_t first_index_kept = snapshot_meta.last_included_index() + 1;
     std::deque<LogEntry*> popped;
     std::unique_lock<raft_mutex_t> lck(_mutex);
     while (!_log_entry_data.empty()) {
@@ -133,7 +134,8 @@ int MemoryLogStorage::truncate_suffix(const int64_t last_index_kept) {
     return 0;
 }
 
-int MemoryLogStorage::reset(const int64_t next_log_index) {
+int MemoryLogStorage::reset(const SnapshotMeta &snapshot_meta) {
+    const int64_t next_log_index = snapshot_meta.last_included_index() + 1;
     if (next_log_index <= 0) {
         LOG(ERROR) << "Invalid next_log_index=" << next_log_index;
         return EINVAL;

@@ -74,9 +74,9 @@ protected:
     void run();
 };
 
-class SnapshotTimer : public NodeTimer {
+class TruncateLogTimer : public NodeTimer {
 public:
-    SnapshotTimer() : _first_schedule(true) {}
+    TruncateLogTimer() : _first_schedule(true) {}
 protected:
     void run();
     int adjust_timeout_ms(int timeout_ms);
@@ -141,8 +141,7 @@ public:
     void change_peers(const Configuration& new_peers, Closure* done);
     butil::Status reset_peers(const Configuration& new_peers);
 
-    // trigger snapshot
-    void snapshot(Closure* done);
+    int64_t get_snapshot_index();
 
     // trigger vote
     butil::Status vote(int election_timeout);
@@ -181,7 +180,7 @@ public:
     void handle_election_timeout();
     void handle_vote_timeout();
     void handle_stepdown_timeout();
-    void handle_snapshot_timeout();
+    void handle_truncate_log_timeout();
     void handle_transfer_timeout(int64_t term, const PeerId& peer);
 
     // Closure call func
@@ -293,8 +292,6 @@ friend class butil::RefCountedThreadSafe<NodeImpl>;
                                     const Configuration* old_conf,
                                     bool leader_start);
 
-    void do_snapshot(Closure* done);
-
     void after_shutdown();
     static void after_shutdown(NodeImpl* node);
 
@@ -325,6 +322,7 @@ friend class butil::RefCountedThreadSafe<NodeImpl>;
     struct DisruptedLeader;
     void request_peers_to_vote(const std::set<PeerId>& peers,
                                const DisruptedLeader& disrupted_leader);
+    void maybe_truncate_log();
 
 private:
 
@@ -517,7 +515,7 @@ private:
     ElectionTimer _election_timer;
     VoteTimer _vote_timer;
     StepdownTimer _stepdown_timer;
-    SnapshotTimer _snapshot_timer;
+    TruncateLogTimer _truncate_log_timer;
     bthread_timer_t _transfer_timer;
     StopTransferArg* _stop_transfer_arg;
     bool _vote_triggered;
@@ -533,6 +531,10 @@ private:
 
     LeaderLease _leader_lease;
     FollowerLease _follower_lease;
+
+    // The last log index that has been successfully replicated to all
+    // peers in this group.
+    int64_t _last_replicated_index;
 };
 
 }

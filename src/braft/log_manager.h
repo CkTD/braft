@@ -80,14 +80,11 @@ public:
     // success return 0, fail return errno
     void append_entries(std::vector<LogEntry*> *entries, StableClosure* done);
 
-    // Notify the log manager about the latest snapshot, which indicates the
-    // logs which can be safely truncated.
-    BRAFT_MOCK void set_snapshot(const SnapshotMeta* meta);
+    // Called by follower when install a new snapshot from leader.
+    BRAFT_MOCK void reset(const SnapshotMeta* meta);
 
-    // We don't delete all the logs before last snapshot to avoid installing
-    // snapshot on slow replica. Call this method to drop all the logs before
-    // last snapshot immediately.
-    BRAFT_MOCK void clear_bufferred_logs();
+    // delete logs from storage's head, save conf and last deleted log's id to meta
+    int truncate_prefix(const int64_t first_index_kept);
 
     // Get the log at |index|
     // Returns:
@@ -144,6 +141,10 @@ public:
     // Returns butil::Status::OK if valid, a specific error otherwise
     butil::Status check_consistency();
 
+    // Get last snapshot id
+    // not under lock since it only used in init phase
+    LogId last_snapshot_id() { return _last_snapshot_id; }
+
     void describe(std::ostream& os, bool use_html);
 
     // Get the internal status of LogManager.
@@ -161,15 +162,6 @@ friend class AppendBatcher;
 
     static int disk_thread(void* meta,
                            bthread::TaskIterator<StableClosure*>& iter);
-    
-    // delete logs from storage's head, [1, first_index_kept) will be discarded
-    // Returns:
-    //  success return 0, failed return -1
-    int truncate_prefix(const int64_t first_index_kept,
-                        std::unique_lock<raft_mutex_t>& lck);
-    
-    int reset(const int64_t next_log_index,
-              std::unique_lock<raft_mutex_t>& lck);
 
     // Must be called in the disk thread, otherwise the
     // behavior is undefined
@@ -218,12 +210,6 @@ friend class AppendBatcher;
     int64_t _last_log_index;
     // the last snapshot's log_id
     LogId _last_snapshot_id;
-    // the virtual first log, for finding next_index of replicator, which 
-    // can avoid install_snapshot too often in extreme case where a follower's
-    // install_snapshot is slower than leader's save_snapshot
-    // [NOTICE] there should not be hole between this log_id and _last_snapshot_id,
-    // or may cause some unexpect cases
-    LogId _virtual_first_log_id;
 
     bthread::ExecutionQueueId<StableClosure*> _disk_queue;
 };

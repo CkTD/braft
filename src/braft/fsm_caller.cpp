@@ -167,10 +167,11 @@ int FSMCaller::init(const FSMCallerOptions &options) {
     _last_applied_index.store(options.bootstrap_id.index,
                               butil::memory_order_relaxed);
     _last_applied_term = options.bootstrap_id.term;
+    _recent_applied_indexes_size = options.index_queue_size;
     if (_node) {
         _node->AddRef();
     }
-    
+
     bthread::ExecutionQueueOptions execq_opt;
     execq_opt.bthread_attr = options.usercode_in_pthread 
                              ? BTHREAD_ATTR_PTHREAD
@@ -425,6 +426,9 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
     _last_applied_index.store(meta.last_included_index(),
                               butil::memory_order_release);
     _last_applied_term = meta.last_included_term();
+    while(!_recent_applied_indexes.empty()) {
+        _recent_applied_indexes.pop();
+    }
     done->Run();
 }
 
@@ -548,6 +552,20 @@ void FSMCaller::join() {
         bthread::execution_queue_join(_queue_id);
         _queue_started = false;
     }
+}
+
+void FSMCaller::get_and_update_recent_applied_indexes(int64_t *prev_applied_index, int64_t *oldest_applied_index) {
+    *prev_applied_index = 0;
+    *oldest_applied_index = 0;
+    if (!_recent_applied_indexes.empty()) {
+        *prev_applied_index = _recent_applied_indexes.back();
+        if (_recent_applied_indexes.size() >= _recent_applied_indexes_size) {
+            *oldest_applied_index = _recent_applied_indexes.front();
+            _recent_applied_indexes.pop();
+        }
+    }
+
+    _recent_applied_indexes.push(_last_applied_index.load(butil::memory_order_relaxed));
 }
 
 IteratorImpl::IteratorImpl(StateMachine* sm, LogManager* lm,

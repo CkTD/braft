@@ -158,7 +158,8 @@ public:
     virtual ~SegmentLogStorage() {}
 
     // init logstorage, check consistency and integrity
-    virtual int init(ConfigurationManager* configuration_manager);
+    virtual int init(ConfigurationManager* configuration_manager,
+                     SnapshotMeta *snapshot_meta);
 
     // first log index in log
     virtual int64_t first_log_index() {
@@ -181,12 +182,12 @@ public:
     virtual int append_entries(const std::vector<LogEntry*>& entries, IOMetric* metric);
 
     // delete logs from storage's head, [1, first_index_kept) will be discarded
-    virtual int truncate_prefix(const int64_t first_index_kept);
+    virtual int truncate_prefix(const SnapshotMeta &snapshot_meta);
 
     // delete uncommitted logs from storage's tail, (last_index_kept, infinity) will be discarded
     virtual int truncate_suffix(const int64_t last_index_kept);
 
-    virtual int reset(const int64_t next_log_index);
+    virtual int reset(const SnapshotMeta &snapshot_meta);
 
     LogStorage* new_instance(const std::string& uri) const;
     
@@ -202,8 +203,8 @@ public:
     void sync();
 private:
     scoped_refptr<Segment> open_segment();
-    int save_meta(const int64_t log_index);
-    int load_meta();
+    int save_meta(const SnapshotMeta &snapshot_meta);
+    int load_meta(SnapshotMeta *snapshot_meta);
     int list_segments(bool is_empty);
     int load_segments(ConfigurationManager* configuration_manager);
     int get_segment(int64_t log_index, scoped_refptr<Segment>* ptr);

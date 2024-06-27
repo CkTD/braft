@@ -43,10 +43,18 @@ struct SnapshotExecutorOptions {
     int64_t init_term;
     butil::EndPoint addr;
     bool filter_before_copy_remote;
-    bool usercode_in_pthread;
     bool copy_file = true;
     scoped_refptr<FileSystemAdaptor> file_system_adaptor;
     scoped_refptr<SnapshotThrottle> snapshot_throttle;
+};
+
+class DoSnapshotClosure : public Closure {
+public:
+    DoSnapshotClosure() : _reader(NULL) {}
+    SnapshotReader *reader() { return _reader; }
+    void set_reader(SnapshotReader *reader) { _reader = reader; }
+private:
+    SnapshotReader *_reader;
 };
 
 // Executing Snapshot related stuff
@@ -61,9 +69,10 @@ public:
     // Return the owner NodeImpl
     NodeImpl* node() const { return _node; }
 
-    // Start to snapshot StateMachine, and |done| is called after the execution
-    // finishes or fails.
-    void do_snapshot(Closure* done);
+    // Get snapshot, |done| is called after the execution finishes or fails. A snapshot reader is
+    // opened when success, caller must close the reader after use to decrease the reference count.
+    // A new snapshot is taken by StateMachine if not exists. Many caller may share a same snapshot.
+    void do_snapshot(DoSnapshotClosure* done);
 
     // Install snapshot according to the very RPC from leader
     // After the installing succeeds (StateMachine is reset with the snapshot)
@@ -80,6 +89,12 @@ public:
                           const InstallSnapshotRequest* request,
                           InstallSnapshotResponse* response,
                           google::protobuf::Closure* done);
+
+    // Dsiable install snapshot temporarily.
+    // Return true when currently not install a snapshot and install is disabled
+    bool disable_install_snapshot();
+    // Enable install snapshot, must be paired with disable_install_snapshot
+    void enable_install_snapshot();
 
     // Interrupt the downloading if possible.
     // This is called when the term of node increased to |new_term|, which
@@ -123,9 +138,9 @@ friend class FirstSnapshotLoadDone;
 friend class InstallSnapshotDone;
 
     void on_snapshot_load_done(const butil::Status& st);
-    int on_snapshot_save_done(const butil::Status& st,
-                              const SnapshotMeta& meta, 
-                              SnapshotWriter* writer);
+    void on_snapshot_save_done(const butil::Status& st,
+                               const SnapshotMeta& meta, 
+                               SnapshotWriter* writer);
 
     struct DownloadingSnapshot {
         const InstallSnapshotRequest* request;
@@ -143,10 +158,9 @@ friend class InstallSnapshotDone;
     void report_error(int error_code, const char* fmt, ...);
 
     raft_mutex_t _mutex;
-    int64_t _last_snapshot_term;
-    int64_t _last_snapshot_index;
     int64_t _term;
-    bool _saving_snapshot;
+    std::vector<DoSnapshotClosure*> _saving_snapshots;
+    bool _install_disabled;
     bool _loading_snapshot;
     bool _stopped;
     bool _usercode_in_pthread;
@@ -172,7 +186,6 @@ inline SnapshotExecutorOptions::SnapshotExecutorOptions()
     , log_manager(NULL)
     , init_term(0)
     , filter_before_copy_remote(false)
-    , usercode_in_pthread(false)
 {}
 
 }  //  namespace braft

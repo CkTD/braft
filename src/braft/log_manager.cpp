@@ -86,10 +86,13 @@ int LogManager::init(const LogManagerOptions &options) {
     }
     _log_storage = options.log_storage;
     _config_manager = options.configuration_manager;
-    int ret = _log_storage->init(_config_manager);
+    SnapshotMeta snapshot_meta;
+    int ret = _log_storage->init(_config_manager, &snapshot_meta);
     if (ret != 0) {
         return ret;
     }
+    _last_snapshot_id.index = snapshot_meta.last_included_index();
+    _last_snapshot_id.term = snapshot_meta.last_included_term();
     _first_log_index = _log_storage->first_log_index();
     _last_log_index = _log_storage->last_log_index();
     _disk_id.index = _last_log_index;
@@ -208,15 +211,16 @@ LogId LogManager::last_log_id(bool is_flush) {
 
 class TruncatePrefixClosure : public LogManager::StableClosure {
 public:
-    explicit TruncatePrefixClosure(const int64_t first_index_kept)
-        : _first_index_kept(first_index_kept)
+    explicit TruncatePrefixClosure(const SnapshotMeta& snapshot_meta)
+        : _snapshot_meta(snapshot_meta)
     {}
     void Run() {
         delete this;
     }
-    int64_t first_index_kept() const { return _first_index_kept; }
+    int64_t first_index_kept() const { return _snapshot_meta.last_included_index() + 1; }
+    const SnapshotMeta& snapshot_meta() const { return _snapshot_meta; }
 private:
-    int64_t _first_index_kept;
+    SnapshotMeta _snapshot_meta;
 };
 
 class TruncateSuffixClosure : public LogManager::StableClosure {
@@ -237,19 +241,36 @@ private:
 
 class ResetClosure : public LogManager::StableClosure {
 public:
-    explicit ResetClosure(int64_t next_log_index)
-        : _next_log_index(next_log_index)
+    explicit ResetClosure(const SnapshotMeta& snapshot_meta)
+        : _snapshot_meta(snapshot_meta)
     {}
     void Run() {
         delete this;
     }
-    int64_t next_log_index() const { return _next_log_index; }
+    const SnapshotMeta& snapshot_meta() const { return _snapshot_meta; }
 private:
     int64_t _next_log_index;
+    SnapshotMeta _snapshot_meta;
 };
 
-int LogManager::truncate_prefix(const int64_t first_index_kept,
-                                std::unique_lock<raft_mutex_t>& lck) {
+int LogManager::truncate_prefix(const int64_t first_index_kept) {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    CHECK_LE(first_index_kept - 1, _last_log_index);
+
+    if (first_index_kept <= _first_log_index) {
+        return 0;
+    }
+
+    int64_t last_include_index = first_index_kept - 1;
+    int64_t last_include_term = unsafe_get_term(last_include_index);
+    CHECK_NE(last_include_term, 0);
+    ConfigurationEntry conf_entry;
+    _config_manager->get(last_include_index, &conf_entry);
+    _last_snapshot_id = LogId(last_include_index, last_include_term);
+    _first_log_index = first_index_kept;
+    _config_manager->set_snapshot(conf_entry);
+    _config_manager->truncate_prefix(first_index_kept);
+
     std::deque<LogEntry*> saved_logs_in_memory;
     // As the duration between two snapshot (which leads to truncate_prefix at
     // last) is likely to be a long period, _logs_in_memory is likely to
@@ -269,14 +290,7 @@ int LogManager::truncate_prefix(const int64_t first_index_kept,
             break;
         }
     }
-    CHECK_GE(first_index_kept, _first_log_index);
-    _first_log_index = first_index_kept;
-    if (first_index_kept > _last_log_index) {
-        // The entrie log is dropped
-        _last_log_index = first_index_kept - 1;
-    }
-    _config_manager->truncate_prefix(first_index_kept);
-    TruncatePrefixClosure* c = new TruncatePrefixClosure(first_index_kept);
+    TruncatePrefixClosure* c = new TruncatePrefixClosure(conf_entry.ToSnapshotMeta());
     const int rc = bthread::execution_queue_execute(_disk_queue, c);
     lck.unlock();
     for (size_t i = 0; i < saved_logs_in_memory.size(); ++i) {
@@ -285,23 +299,32 @@ int LogManager::truncate_prefix(const int64_t first_index_kept,
     return rc;
 }
 
-int LogManager::reset(const int64_t next_log_index,
-                      std::unique_lock<raft_mutex_t>& lck) {
-    CHECK(lck.owns_lock());
+void LogManager::reset(const SnapshotMeta* snapshot_meta) {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    // Note: reset is called after a snapshot is successfully installed.
+    // The installed snapshot's last_included_index must be greater than the current applied_index,
+    // and the current applied_index must be greater than _last_snapshot_id.index, which is set by truncate_prefix after apply.
+    CHECK(snapshot_meta->last_included_index() > _last_snapshot_id.index);
+
     std::deque<LogEntry*> saved_logs_in_memory;
     saved_logs_in_memory.swap(_logs_in_memory);
-    _first_log_index = next_log_index;
-    _last_log_index = next_log_index - 1;
+
+    _last_snapshot_id = LogId(snapshot_meta->last_included_index(),
+                              snapshot_meta->last_included_term());
+    _applied_id = _last_snapshot_id;
+    _first_log_index = _last_snapshot_id.index + 1;
+    _last_log_index = _last_snapshot_id.index;
     _config_manager->truncate_prefix(_first_log_index);
     _config_manager->truncate_suffix(_last_log_index);
-    ResetClosure* c = new ResetClosure(next_log_index);
+    _config_manager->set_snapshot(*snapshot_meta);
+
+    ResetClosure* c = new ResetClosure(*snapshot_meta);
     const int ret = bthread::execution_queue_execute(_disk_queue, c);
     lck.unlock();
     CHECK_EQ(0, ret) << "execq execute failed, ret: " << ret << " err: " << berror();
     for (size_t i = 0; i < saved_logs_in_memory.size(); ++i) {
         saved_logs_in_memory[i]->Release();
     }
-    return 0;
 }
 
 void LogManager::unsafe_truncate_suffix(const int64_t last_index_kept) {
@@ -577,9 +600,8 @@ int LogManager::disk_thread(void* meta,
                         dynamic_cast<TruncatePrefixClosure*>(done);
                 if (tpc) {
                     BRAFT_VLOG << "Truncating storage to first_index_kept="
-                        << tpc->first_index_kept();
-                    ret = log_manager->_log_storage->truncate_prefix(
-                                    tpc->first_index_kept());
+                        << tpc->snapshot_meta().last_included_index() + 1;
+                    ret = log_manager->_log_storage->truncate_prefix(tpc->snapshot_meta());
                     break;
                 }
                 TruncateSuffixClosure* tsc = 
@@ -601,8 +623,8 @@ int LogManager::disk_thread(void* meta,
                 ResetClosure* rc = dynamic_cast<ResetClosure*>(done);
                 if (rc) {
                     LOG(INFO) << "Reseting storage to next_log_index="
-                              << rc->next_log_index();
-                    ret = log_manager->_log_storage->reset(rc->next_log_index());
+                              << rc->snapshot_meta().last_included_index() + 1;
+                    ret = log_manager->_log_storage->reset(rc->snapshot_meta());
                     break;
                 }
             } while (0);
@@ -617,74 +639,6 @@ int LogManager::disk_thread(void* meta,
     ab.flush();
     log_manager->set_disk_id(last_id);
     return 0;
-}
-
-void LogManager::set_snapshot(const SnapshotMeta* meta) {
-    BRAFT_VLOG << "Set snapshot last_included_index="
-              << meta->last_included_index()
-              << " last_included_term=" <<  meta->last_included_term();
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (meta->last_included_index() <= _last_snapshot_id.index) {
-        return;
-    }
-    Configuration conf;
-    for (int i = 0; i < meta->peers_size(); ++i) {
-        conf.add_peer(meta->peers(i));
-    }
-    Configuration old_conf;
-    for (int i = 0; i < meta->old_peers_size(); ++i) {
-        old_conf.add_peer(meta->old_peers(i));
-    }
-    ConfigurationEntry entry;
-    entry.id = LogId(meta->last_included_index(), meta->last_included_term());
-    entry.conf = conf;
-    entry.old_conf = old_conf;
-    _config_manager->set_snapshot(entry);
-    int64_t term = unsafe_get_term(meta->last_included_index());
-
-    const LogId last_but_one_snapshot_id = _last_snapshot_id;
-    _last_snapshot_id.index = meta->last_included_index();
-    _last_snapshot_id.term = meta->last_included_term();
-    if (_last_snapshot_id > _applied_id) {
-        _applied_id = _last_snapshot_id;
-    }
-    // NOTICE: not to update disk_id here as we are not sure if this node really
-    // has these logs on disk storage. Just leave disk_id as it was, which can keep
-    // these logs in memory all the time until they are flushed to disk. By this 
-    // way we can avoid some corner cases which failed to get logs.
-    
-    if (term == 0) {
-        // last_included_index is larger than last_index
-        // FIXME: what if last_included_index is less than first_index?
-        _virtual_first_log_id = _last_snapshot_id;
-        truncate_prefix(meta->last_included_index() + 1, lck);
-        return;
-    } else if (term == meta->last_included_term()) {
-        // Truncating log to the index of the last snapshot.
-        // We don't truncate log before the latest snapshot immediately since
-        // some log around last_snapshot_index is probably needed by some
-        // followers
-        if (last_but_one_snapshot_id.index > 0) {
-            // We have last snapshot index
-            _virtual_first_log_id = last_but_one_snapshot_id;
-            truncate_prefix(last_but_one_snapshot_id.index + 1, lck);
-        }
-        return;
-    } else {
-        // TODO: check the result of reset.
-        _virtual_first_log_id = _last_snapshot_id;
-        reset(meta->last_included_index() + 1, lck);
-        return;
-    }
-    CHECK(false) << "Cannot reach here";
-}
-
-void LogManager::clear_bufferred_logs() {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_last_snapshot_id.index != 0) {
-        _virtual_first_log_id = _last_snapshot_id;
-        truncate_prefix(_last_snapshot_id.index + 1, lck);
-    }
 }
 
 LogEntry* LogManager::get_entry_from_memory(const int64_t index) {
@@ -703,10 +657,6 @@ LogEntry* LogManager::get_entry_from_memory(const int64_t index) {
 int64_t LogManager::unsafe_get_term(const int64_t index) {
     if (index == 0) {
         return 0;
-    }
-    // check virtual first log
-    if (index == _virtual_first_log_id.index) {
-        return _virtual_first_log_id.term;
     }
     // check last_snapshot_id
     if (index == _last_snapshot_id.index) {
@@ -732,10 +682,6 @@ int64_t LogManager::get_term(const int64_t index) {
         return 0;
     }
     std::unique_lock<raft_mutex_t> lck(_mutex);
-    // check virtual first log
-    if (index == _virtual_first_log_id.index) {
-        return _virtual_first_log_id.term;
-    }
     // check last_snapshot_id
     if (index == _last_snapshot_id.index) {
         return _last_snapshot_id.term;

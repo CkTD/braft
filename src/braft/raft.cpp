@@ -202,12 +202,12 @@ butil::Status Node::reset_peers(const Configuration& new_peers) {
     return _impl->reset_peers(new_peers);
 }
 
-void Node::snapshot(Closure* done) {
-    _impl->snapshot(done);
-}
-
 butil::Status Node::vote(int election_timeout) {
     return _impl->vote(election_timeout);
+}
+
+int64_t Node::get_snapshot_index(){
+    return _impl->get_snapshot_index();
 }
 
 butil::Status Node::reset_election_timeout_ms(int election_timeout_ms) {

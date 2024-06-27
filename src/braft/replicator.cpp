@@ -59,13 +59,26 @@ static bvar::LatencyRecorder g_normalized_send_entries_latency(
 static bvar::CounterRecorder g_send_entries_batch_counter(
              "raft_send_entries_batch_counter");
 
+
+class OnDemandSnapshotDone : public DoSnapshotClosure {
+public:
+    OnDemandSnapshotDone(ReplicatorId id, SnapshotExecutor *snapshot_executor): 
+        _id(id), _snapshot_executor(snapshot_executor) {};
+    virtual ~OnDemandSnapshotDone() {};
+    virtual void Run();
+
+private:
+    ReplicatorId _id;
+    SnapshotExecutor *_snapshot_executor;
+};
+
 ReplicatorOptions::ReplicatorOptions()
     : dynamic_heartbeat_timeout_ms(NULL)
     , log_manager(NULL)
     , ballot_box(NULL)
     , node(NULL)
     , term(0)
-    , snapshot_storage(NULL)
+    , snapshot_executor(NULL)
     , replicator_status(NULL)
 {
 }
@@ -550,6 +563,7 @@ int Replicator::_fill_common_fields(AppendEntriesRequest* request,
     request->set_prev_log_index(prev_log_index);
     request->set_prev_log_term(prev_log_term);
     request->set_committed_index(_options.ballot_box->last_committed_index());
+    request->set_replicated_index(_last_replicated_index());
     return 0;
 }
 
@@ -582,7 +596,8 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
         << " send HeartbeatRequest to " << _options.peer_id 
         << " term " << _options.term
         << " prev_log_index " << request->prev_log_index()
-        << " last_committed_index " << request->committed_index();
+        << " last_committed_index " << request->committed_index()
+        << " last_replicated_index " << request->replicated_index();
 
     google::protobuf::Closure* done = brpc::NewCallback(
                 is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, 
@@ -769,6 +784,23 @@ void Replicator::_wait_more_entries() {
     CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
 }
 
+void OnDemandSnapshotDone::Run() {
+    Replicator *r = NULL;
+    bthread_id_t dummy_id = { _id };
+
+    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+        LOG(WARNING) << "replicator " << _id << " destoryed before on demand snapshot done";
+        if (status().ok()) {
+            CHECK(reader());
+            _snapshot_executor->snapshot_storage()->close(reader());
+        }
+        return;
+    }
+    // dummy_id is unlock in _continue_install_snapshot
+    r->_continue_install_snapshot(status(), reader());
+    delete this;
+}
+
 void Replicator::_install_snapshot() {
      NodeImpl *node_impl = _options.node;
     if (node_impl->is_witness()) {
@@ -795,8 +827,33 @@ void Replicator::_install_snapshot() {
     // blocked if something is wrong, such as throttled for a period of time 
     _st.st = INSTALLING_SNAPSHOT;
 
-    _reader = _options.snapshot_storage->open();
-    if (!_reader) {
+    if (_consecutive_error_times > 0) {
+        // NOTE: if the followers have some error, we should not install a snapshot to it. 
+        //       allowing the installation of a snapshot in this case would cause the leader 
+        //       node to repeat a loop which is unacceptable. This loop involves saving an 
+        //       on-demand snapshot, attempting to install it to the follower (which fails),
+        //       destroying the snapshot, waiting for a while, and then try again.
+        // FIXME: if the rpcs to the follower is okay, but the follower fails to install the
+        //        snapshot immediately(e.g. throttled), the loop described above can still happen.
+        //        maybe this is unlikey to happend and don't needs to be addressed.      
+        LOG(WARNING) << "node " << _options.group_id << ":" << _options.server_id
+                     << " refuse to send InstallSnapshotRequest to " << _options.peer_id
+                     << " because _consecutive_error_times is " << _consecutive_error_times;
+        // _id is unlock in _block
+        return _block(butil::gettimeofday_us(), EHOSTUNREACH);
+    }
+
+    // continue after snapshot ready
+    OnDemandSnapshotDone *onDemandSnapshotDone = 
+            new OnDemandSnapshotDone(_id.value, _options.snapshot_executor);
+    _options.snapshot_executor->do_snapshot(onDemandSnapshotDone);
+    CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+}
+
+void Replicator::_continue_install_snapshot(butil::Status status, SnapshotReader *reader) {
+    CHECK(!_reader);
+    if (!reader) {
+        CHECK(!status.ok());
         if (_options.snapshot_throttle) {
             _options.snapshot_throttle->finish_one_task(true);
         }
@@ -810,6 +867,10 @@ void Replicator::_install_snapshot() {
         node_impl->Release();
         return;
     } 
+
+    CHECK(status.ok());
+    _reader = reader;
+
     std::string uri = _reader->generate_uri_for_copy();
     // NOTICE: If uri is something wrong, retry later instead of reporting error
     // immediately(making raft Node error), as FileSystemAdaptor layer of _reader is 
@@ -879,13 +940,7 @@ void Replicator::_on_install_snapshot_returned(
     if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
         return;
     }
-    if (r->_reader) {
-        r->_options.snapshot_storage->close(r->_reader);
-        r->_reader = NULL;
-        if (r->_options.snapshot_throttle) {
-            r->_options.snapshot_throttle->finish_one_task(true);
-        }
-    }
+    r->_close_reader();
     std::stringstream ss;
     ss << "received InstallSnapshotResponse from "
        << r->_options.group_id << ":" << r->_options.peer_id
@@ -1346,7 +1401,7 @@ void Replicator::get_status(ReplicatorId id, PeerStatus* status) {
 
 void Replicator::_close_reader() {
     if (_reader) {
-        _options.snapshot_storage->close(_reader);
+        _options.snapshot_executor->snapshot_storage()->close(_reader);
         _reader = NULL;
         if (_options.snapshot_throttle) {
             _options.snapshot_throttle->finish_one_task(true);
@@ -1362,7 +1417,7 @@ ReplicatorGroupOptions::ReplicatorGroupOptions()
     , log_manager(NULL)
     , ballot_box(NULL)
     , node(NULL)
-    , snapshot_storage(NULL)
+    , snapshot_executor(NULL)
 {}
 
 ReplicatorGroup::ReplicatorGroup() 
@@ -1386,7 +1441,7 @@ int ReplicatorGroup::init(const NodeId& node_id, const ReplicatorGroupOptions& o
     _common_options.term = 0;
     _common_options.group_id = node_id.group_id;
     _common_options.server_id = node_id.peer_id;
-    _common_options.snapshot_storage = options.snapshot_storage;
+    _common_options.snapshot_executor = options.snapshot_executor;
     _common_options.snapshot_throttle = options.snapshot_throttle;
     _common_options.replicator_status = NULL;
     return 0;
@@ -1560,6 +1615,30 @@ int ReplicatorGroup::find_the_next_candidate(
         return -1;
     }
     return 0;
+}
+
+int64_t ReplicatorGroup::update_last_replicated_index() {
+    int64_t min_next_index = INT64_MAX;
+    for (std::map<PeerId, ReplicatorIdAndStatus>::const_iterator
+            iter = _rmap.begin();  iter != _rmap.end(); ++iter) {
+        int64_t next_index = Replicator::get_next_index(iter->second.id);
+        if (next_index == 0) {
+            return 0;
+        }
+        if (next_index < min_next_index) {
+            min_next_index = next_index;
+        }
+    }
+
+    int64_t last_replicated_index = min_next_index - 1;
+    for (std::map<PeerId, ReplicatorIdAndStatus>::const_iterator
+        iter = _rmap.begin();  iter != _rmap.end(); ++iter) {
+        butil::atomic<int64_t> &index = iter->second.status->last_replicated_index;
+        if (last_replicated_index > index.load(butil::memory_order_relaxed)) {
+            index.store(last_replicated_index, butil::memory_order_relaxed);
+        }
+    }
+    return last_replicated_index;
 }
 
 void ReplicatorGroup::list_replicators(std::vector<ReplicatorId>* out) const {

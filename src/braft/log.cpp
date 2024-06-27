@@ -679,7 +679,8 @@ int Segment::truncate(const int64_t last_index_kept) {
     return ret;
 }
 
-int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
+int SegmentLogStorage::init(ConfigurationManager* configuration_manager,
+                            SnapshotMeta *snapshot_meta) {
     if (FLAGS_raft_max_segment_size < 0) {
         LOG(FATAL) << "FLAGS_raft_max_segment_size " << FLAGS_raft_max_segment_size  
                    << " must be greater than or equal to 0 ";
@@ -704,14 +705,14 @@ int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
     int ret = 0;
     bool is_empty = false;
     do {
-        ret = load_meta();
+        ret = load_meta(snapshot_meta);
         if (ret != 0 && errno == ENOENT) {
             LOG(WARNING) << _path << " is empty";
             is_empty = true;
         } else if (ret != 0) {
             break;
         }
-
+        configuration_manager->set_snapshot(*snapshot_meta);
         ret = list_segments(is_empty);
         if (ret != 0) {
             break;
@@ -721,12 +722,16 @@ int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
         if (ret != 0) {
             break;
         }
+        configuration_manager->truncate_prefix(snapshot_meta->last_included_index() + 1);
     } while (0);
 
     if (is_empty) {
         _first_log_index.store(1);
         _last_log_index.store(0);
-        ret = save_meta(1);
+        snapshot_meta->Clear();
+        snapshot_meta->set_last_included_index(0);
+        snapshot_meta->set_last_included_term(0);
+        ret = save_meta(*snapshot_meta);
     }
     return ret;
 }
@@ -851,7 +856,8 @@ void SegmentLogStorage::pop_segments(
     }
 }
 
-int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept) {
+int SegmentLogStorage::truncate_prefix(const SnapshotMeta &snapshot_meta) {
+    int64_t first_index_kept = snapshot_meta.last_included_index() + 1;
     // segment files
     if (_first_log_index.load(butil::memory_order_acquire) >= first_index_kept) {
       BRAFT_VLOG << "Nothing is going to happen since _first_log_index=" 
@@ -864,7 +870,7 @@ int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept) {
     // consensus. We try to save meta on the disk first to make sure even if
     // the deleting fails or the process crashes (which is unlikely to happen).
     // The new process would see the latest `first_log_index'
-    if (save_meta(first_index_kept) != 0) { // NOTE
+    if (save_meta(snapshot_meta) != 0) { // NOTE
         PLOG(ERROR) << "Fail to save meta, path: " << _path;
         return -1;
     }
@@ -963,7 +969,8 @@ int SegmentLogStorage::truncate_suffix(const int64_t last_index_kept) {
     return ret;
 }
 
-int SegmentLogStorage::reset(const int64_t next_log_index) {
+int SegmentLogStorage::reset(const SnapshotMeta& snapshot_meta) {
+    int64_t next_log_index = snapshot_meta.last_included_index() + 1;
     if (next_log_index <= 0) {
         LOG(ERROR) << "Invalid next_log_index=" << next_log_index
                    << " path: " << _path;
@@ -985,7 +992,7 @@ int SegmentLogStorage::reset(const int64_t next_log_index) {
     _last_log_index.store(next_log_index - 1, butil::memory_order_relaxed);
     lck.unlock();
     // NOTE: see the comments in truncate_prefix
-    if (save_meta(next_log_index) != 0) {
+    if (save_meta(snapshot_meta) != 0) {
         PLOG(ERROR) << "Fail to save meta, path: " << _path;
         return -1;
     }
@@ -1148,7 +1155,8 @@ int SegmentLogStorage::load_segments(ConfigurationManager* configuration_manager
     return 0;
 }
 
-int SegmentLogStorage::save_meta(const int64_t log_index) {
+int SegmentLogStorage::save_meta(const SnapshotMeta &snapshot_meta) {
+    int64_t first_log_index = snapshot_meta.last_included_index() + 1;
     butil::Timer timer;
     timer.start();
 
@@ -1156,18 +1164,20 @@ int SegmentLogStorage::save_meta(const int64_t log_index) {
     meta_path.append("/" BRAFT_SEGMENT_META_FILE);
 
     LogPBMeta meta;
-    meta.set_first_log_index(log_index);
+    meta.set_first_log_index(first_log_index);
+    *meta.mutable_snapshot() = snapshot_meta;
     ProtoBufFile pb_file(meta_path);
     int ret = pb_file.save(&meta, raft_sync_meta());
 
     timer.stop();
     PLOG_IF(ERROR, ret != 0) << "Fail to save meta to " << meta_path;
-    LOG(INFO) << "log save_meta " << meta_path << " first_log_index: " << log_index
+    LOG(INFO) << "log save_meta " << meta_path 
+              << " snapshot: " << snapshot_meta.ShortDebugString()
               << " time: " << timer.u_elapsed();
     return ret;
 }
 
-int SegmentLogStorage::load_meta() {
+int SegmentLogStorage::load_meta(SnapshotMeta *snapshot_meta) {
     butil::Timer timer;
     timer.start();
 
@@ -1181,10 +1191,13 @@ int SegmentLogStorage::load_meta() {
         return -1;
     }
 
-    _first_log_index.store(meta.first_log_index());
+    CHECK(meta.has_snapshot());
+    CHECK_EQ(meta.snapshot().last_included_index() + 1, meta.first_log_index());
+    _first_log_index.store(meta.snapshot().last_included_index() + 1);
+    *snapshot_meta = meta.snapshot();
 
     timer.stop();
-    LOG(INFO) << "log load_meta " << meta_path << " first_log_index: " << meta.first_log_index()
+    LOG(INFO) << "log load_meta " << meta_path << " snapshot: " << snapshot_meta->ShortDebugString()
               << " time: " << timer.u_elapsed();
     return 0;
 }

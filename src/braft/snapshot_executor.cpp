@@ -22,14 +22,9 @@
 
 namespace braft {
 
-DEFINE_int32(raft_do_snapshot_min_index_gap, 1, 
-             "Will do snapshot only when actual gap between applied_index and"
-             " last_snapshot_index is equal to or larger than this value");
-BRPC_VALIDATE_GFLAG(raft_do_snapshot_min_index_gap, brpc::PositiveInteger);
-
 class SaveSnapshotDone : public SaveSnapshotClosure {
 public:
-    SaveSnapshotDone(SnapshotExecutor* node, SnapshotWriter* writer, Closure* done);
+    SaveSnapshotDone(SnapshotExecutor* node, SnapshotWriter* writer);
     virtual ~SaveSnapshotDone();
 
     SnapshotWriter* start(const SnapshotMeta& meta);
@@ -40,7 +35,6 @@ private:
 
     SnapshotExecutor* _se;
     SnapshotWriter* _writer;
-    Closure* _done; // user done
     SnapshotMeta _meta;
 };
 
@@ -82,10 +76,8 @@ private:
 };
 
 SnapshotExecutor::SnapshotExecutor()
-    : _last_snapshot_term(0)
-    , _last_snapshot_index(0)
-    , _term(0)
-    , _saving_snapshot(false)
+    : _term(0)
+    , _install_disabled(false)
     , _loading_snapshot(false)
     , _stopped(false)
     , _snapshot_storage(NULL)
@@ -102,7 +94,7 @@ SnapshotExecutor::SnapshotExecutor()
 SnapshotExecutor::~SnapshotExecutor() {
     shutdown();
     join();
-    CHECK(!_saving_snapshot);
+    CHECK(_saving_snapshots.empty());
     CHECK(!_cur_copier);
     CHECK(!_loading_snapshot);
     CHECK(!_downloading_snapshot.load(butil::memory_order_relaxed));
@@ -111,15 +103,14 @@ SnapshotExecutor::~SnapshotExecutor() {
     }
 }
 
-void SnapshotExecutor::do_snapshot(Closure* done) {
+void SnapshotExecutor::do_snapshot(DoSnapshotClosure* done) {
+    CHECK(done);
     std::unique_lock<raft_mutex_t> lck(_mutex);
-    int64_t saved_last_snapshot_index = _last_snapshot_index;
-    int64_t saved_last_snapshot_term = _last_snapshot_term;
     if (_stopped) {
         lck.unlock();
         if (done) {
             done->status().set_error(EPERM, "Is stopped");
-            run_closure_in_bthread(done, _usercode_in_pthread);
+            run_closure_in_bthread(done);
         }
         return;
     }
@@ -128,81 +119,57 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
         lck.unlock();
         if (done) {
             done->status().set_error(EBUSY, "Is loading another snapshot");
-            run_closure_in_bthread(done, _usercode_in_pthread);
+            run_closure_in_bthread(done);
         }
         return;
     }
 
-    // check snapshot saving?
-    if (_saving_snapshot) {
+    // is saving snapshot? wait that ready and share it
+    if (!_saving_snapshots.empty()) {
+        _saving_snapshots.push_back(done);
+        return;
+    }
+
+    // already have a snapshot? reuse it
+    SnapshotReader* reader = _snapshot_storage->open();
+    if (reader) {
         lck.unlock();
-        if (done) {
-            done->status().set_error(EBUSY, "Is saving another snapshot");
-            run_closure_in_bthread(done, _usercode_in_pthread);
-        }
+        done->set_reader(reader);
+        run_closure_in_bthread(done);
         return;
-    }
-    int64_t saved_fsm_applied_index = _fsm_caller->last_applied_index();
-    if (saved_fsm_applied_index - _last_snapshot_index < 
-                                        FLAGS_raft_do_snapshot_min_index_gap) {
-        // There might be false positive as the last_applied_index() is being
-        // updated. But it's fine since we will do next snapshot saving in a
-        // predictable time.
+    } else if (errno != ENODATA) {
         lck.unlock();
-
-        _log_manager->clear_bufferred_logs();
-        LOG_IF(INFO, _node != NULL) << "node " << _node->node_id()
-            << " the gap between fsm applied index " << saved_fsm_applied_index
-            << " and last_snapshot_index " << saved_last_snapshot_index
-            << " is less than " << FLAGS_raft_do_snapshot_min_index_gap
-            << ", will clear bufferred logs and return success";
-
-        if (done) {
-            run_closure_in_bthread(done, _usercode_in_pthread);
-        }
+        done->status().set_error(EIO, "Fail to create snapshot reader");
+        run_closure_in_bthread(done);
+        report_error(EIO, "Fail to craete snapshot reader");
         return;
     }
-    
+
+    // we need take a new snapshot.
     SnapshotWriter* writer = _snapshot_storage->create();
     if (!writer) {
         lck.unlock();
-        if (done) {
-            done->status().set_error(EIO, "Fail to create writer");
-            run_closure_in_bthread(done, _usercode_in_pthread);
-        }
+        done->status().set_error(EIO, "Fail to create writer");
+        run_closure_in_bthread(done);
         report_error(EIO, "Fail to create SnapshotWriter");
         return;
     }
-    _saving_snapshot = true;
-    SaveSnapshotDone* snapshot_save_done = new SaveSnapshotDone(this, writer, done);
+    SaveSnapshotDone* snapshot_save_done = new SaveSnapshotDone(this, writer);
     if (_fsm_caller->on_snapshot_save(snapshot_save_done) != 0) {
         lck.unlock();
         if (done) {
             snapshot_save_done->status().set_error(EHOSTDOWN, "The raft node is down");
-            run_closure_in_bthread(snapshot_save_done, _usercode_in_pthread);
+            run_closure_in_bthread(snapshot_save_done);
         }
         return;
     }
+    _saving_snapshots.push_back(done);
     _running_jobs.add_count(1);
 }
 
-int SnapshotExecutor::on_snapshot_save_done(
+void SnapshotExecutor::on_snapshot_save_done(
     const butil::Status& st, const SnapshotMeta& meta, SnapshotWriter* writer) {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
     int ret = st.error_code();
-    // InstallSnapshot can break SaveSnapshot, check InstallSnapshot when SaveSnapshot
-    // because upstream Snapshot maybe newer than local Snapshot.
-    if (st.ok()) {
-        if (meta.last_included_index() <= _last_snapshot_index) {
-            ret = ESTALE;
-            LOG_IF(WARNING, _node != NULL) << "node " << _node->node_id()
-                << " discards an stale snapshot "
-                << " last_included_index " << meta.last_included_index()
-                << " last_snapshot_index " << _last_snapshot_index;
-            writer->set_error(ESTALE, "Installing snapshot is older than local snapshot");
-        }
-    }
-    lck.unlock();
     
     if (ret == 0) {
         if (writer->save_meta(meta)) {
@@ -220,28 +187,41 @@ int SnapshotExecutor::on_snapshot_save_done(
         LOG(WARNING) << "node " << _node->node_id() << " fail to close writer";
     }
 
-    std::stringstream ss;
-    if (_node) {
-        ss << "node " << _node->node_id() << ' ';
-    }
-    lck.lock();
-    if (ret == 0) {
-        _last_snapshot_index = meta.last_included_index();
-        _last_snapshot_term = meta.last_included_term();
-        lck.unlock();
-        ss << "snapshot_save_done, last_included_index=" << meta.last_included_index()
-           << " last_included_term=" << meta.last_included_term(); 
-        LOG(INFO) << ss.str();
-        _log_manager->set_snapshot(&meta);
-        lck.lock();
-    }
     if (ret == EIO) {
         report_error(EIO, "Fail to save snapshot");
     }
-    _saving_snapshot = false;
+
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    int done_size = _saving_snapshots.size();
+    for (int i = 0; i < done_size; i++) {
+        DoSnapshotClosure* done = _saving_snapshots[i];
+        if (ret == 0) { // FSM ok, writer ok
+            SnapshotReader *reader = _snapshot_storage->open();
+            if (!reader) {
+                ret = errno;
+                done->status().set_error(errno, "Fail to open snapshot");
+                report_error(errno, "Fail to open snapshot");
+            } else {
+                done->set_reader(reader);
+            }
+        } else if (st.ok()) { // FSM ok, something wrong with writer or reader
+            done->status().set_error(ret, "node call on_snapshot_save_done failed");
+        } else { // FSM error
+            done->status() = st;
+        }
+        run_closure_in_bthread(done);
+    }
+    _saving_snapshots.clear();
     lck.unlock();
     _running_jobs.signal();
-    return ret;
+    std::stringstream ss;
+    if (_node) {
+        ss << "node " << _node->node_id() << " ";
+    }
+    ss << "snapshot_save_done, last_included_index=" << meta.last_included_index()
+       << " last_included_term=" << meta.last_included_term()
+       << " ret_code=" << ret << " waiting_replicators=" << done_size;
+    LOG(INFO) << ss.str();
 }
 
 void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
@@ -251,9 +231,7 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
     DownloadingSnapshot* m = _downloading_snapshot.load(butil::memory_order_relaxed);
 
     if (st.ok()) {
-        _last_snapshot_index = _loading_snapshot_meta.last_included_index();
-        _last_snapshot_term = _loading_snapshot_meta.last_included_term();
-        _log_manager->set_snapshot(&_loading_snapshot_meta);
+        _log_manager->reset(&_loading_snapshot_meta);
     }
     std::stringstream ss;
     if (_node) {
@@ -285,9 +263,8 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
 }
 
 SaveSnapshotDone::SaveSnapshotDone(SnapshotExecutor* se, 
-                                   SnapshotWriter* writer, 
-                                   Closure* done)
-    : _se(se), _writer(writer), _done(done) {
+                                   SnapshotWriter* writer)
+    : _se(se), _writer(writer) {
     // here AddRef, SaveSnapshot maybe async
     if (se->node()) {
         se->node()->AddRef();
@@ -308,19 +285,7 @@ SnapshotWriter* SaveSnapshotDone::start(const SnapshotMeta& meta) {
 void* SaveSnapshotDone::continue_run(void* arg) {
     SaveSnapshotDone* self = (SaveSnapshotDone*)arg;
     std::unique_ptr<SaveSnapshotDone> self_guard(self);
-    // Must call on_snapshot_save_done to clear _saving_snapshot
-    int ret = self->_se->on_snapshot_save_done(
-        self->status(), self->_meta, self->_writer);
-    if (ret != 0 && self->status().ok()) {
-        self->status().set_error(ret, "node call on_snapshot_save_done failed");
-    }
-    //user done, need set error
-    if (self->_done) {
-        self->_done->status() = self->status();
-    }
-    if (self->_done) {
-        run_closure_in_bthread(self->_done, true);
-    }
+    self->_se->on_snapshot_save_done(self->status(), self->_meta, self->_writer);
     return NULL;
 }
 
@@ -346,7 +311,6 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
     _fsm_caller = options.fsm_caller;
     _node = options.node;
     _term = options.init_term;
-    _usercode_in_pthread = options.usercode_in_pthread;
 
     _snapshot_storage = SnapshotStorage::create(options.uri);
     if (!_snapshot_storage) {
@@ -376,27 +340,24 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
     if (!options.copy_file) {
         tmp->set_copy_file(false);
     }
-    SnapshotReader* reader = _snapshot_storage->open();
-    if (reader == NULL) {
-        return 0;
-    }
-    if (reader->load_meta(&_loading_snapshot_meta) != 0) {
-        LOG(ERROR) << "Fail to load meta from `" << options.uri << "'";
-        _snapshot_storage->close(reader);
-        return -1;
-    }
-    _loading_snapshot = true;
-    _running_jobs.add_count(1);
-    // Load snapshot ater startup
-    FirstSnapshotLoadDone done(this, reader);
-    CHECK_EQ(0, _fsm_caller->on_snapshot_load(&done));
-    done.wait_for_run();
-    _snapshot_storage->close(reader);
-    if (!done.status().ok()) {
-        LOG(ERROR) << "Fail to load snapshot from " << options.uri;
-        return -1;
-    }
     return 0;
+}
+
+bool SnapshotExecutor::disable_install_snapshot() {
+    BAIDU_SCOPED_LOCK(_mutex);
+    if (_downloading_snapshot.load(butil::memory_order_relaxed)) {
+        return false;
+    }
+    CHECK(!_install_disabled);
+    _install_disabled = true;
+    return true;
+}
+
+void SnapshotExecutor::enable_install_snapshot() {
+    BAIDU_SCOPED_LOCK(_mutex);
+    CHECK(_install_disabled);
+    CHECK(!_downloading_snapshot.load(butil::memory_order_relaxed));
+    _install_disabled = false;
 }
 
 void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
@@ -519,16 +480,21 @@ int SnapshotExecutor::register_downloading_snapshot(DownloadingSnapshot* ds) {
         ds->response->set_term(_term);
         return -1;
     }
-    if (ds->request->meta().last_included_index() <= _last_snapshot_index) {
+    if (ds->request->meta().last_included_index() <= _fsm_caller->last_applied_index()) {
         LOG(WARNING) << "Register failed: snapshot is not newer.";
         ds->response->set_term(_term);
         ds->response->set_success(true);
         return -1;
     }
     ds->response->set_term(_term);
-    if (_saving_snapshot) {
+    if (!_saving_snapshots.empty()) {
         LOG(WARNING) << "Register failed: is saving snapshot.";
         ds->cntl->SetFailed(EBUSY, "Is saving snapshot");
+        return -1;
+    }
+    if (_install_disabled) {
+        LOG(WARNING) << "Register failed: install disabled.";
+        ds->cntl->SetFailed(EBUSY, "Install snapshot is disabled.");
         return -1;
     }
     DownloadingSnapshot* m = _downloading_snapshot.load(
@@ -634,8 +600,6 @@ void SnapshotExecutor::describe(std::ostream&os, bool use_html) {
     SnapshotMeta meta;
     InstallSnapshotRequest request;
     std::unique_lock<raft_mutex_t> lck(_mutex);
-    const int64_t last_snapshot_index = _last_snapshot_index;
-    const int64_t last_snapshot_term = _last_snapshot_term;
     const bool is_loading_snapshot = _loading_snapshot;
     if (is_loading_snapshot) {
         meta = _loading_snapshot_meta;
@@ -649,24 +613,24 @@ void SnapshotExecutor::describe(std::ostream&os, bool use_html) {
         request.CopyFrom(*m->request);
              // ^ It's also a little expansive, but fine
     }
-    const bool is_saving_snapshot = _saving_snapshot;
+    const int saving_snapshots = _saving_snapshots.size();
     // TODO: add timestamp of snapshot
     lck.unlock();
+    _snapshot_storage->describe(os, use_html);
     const char *newline = use_html ? "<br>" : "\r\n";
-    os << "last_snapshot_index: " << last_snapshot_index << newline;
-    os << "last_snapshot_term: " << last_snapshot_term << newline;
     if (m && is_loading_snapshot) {
-        CHECK(!is_saving_snapshot);
+        CHECK(saving_snapshots == 0);
         os << "snapshot_status: LOADING" << newline;
         os << "snapshot_from: " << request.uri() << newline;
         os << "snapshot_meta: " << meta.ShortDebugString();
     } else if (m) {
-        CHECK(!is_saving_snapshot);
+        CHECK(saving_snapshots == 0);
         os << "snapshot_status: DOWNLOADING" << newline;
         os << "downloading_snapshot_from: " << request.uri() << newline;
         os << "downloading_snapshot_meta: " << request.meta().ShortDebugString();
-    } else if (is_saving_snapshot) {
+    } else if (saving_snapshots) {
         os << "snapshot_status: SAVING" << newline;
+        os << "waiting_replicators: " << saving_snapshots << newline;
     } else {
         os << "snapshot_status: IDLE" << newline;
     }

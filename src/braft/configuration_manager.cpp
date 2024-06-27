@@ -18,6 +18,16 @@
 
 namespace braft {
 
+ConfigurationEntry::ConfigurationEntry(const SnapshotMeta &snapshot) {
+    for (int i = 0; i < snapshot.peers_size(); ++i) {
+        conf.add_peer(snapshot.peers(i));
+    }
+    for (int i = 0; i < snapshot.old_peers_size(); ++i) {
+        old_conf.add_peer(snapshot.old_peers(i));
+    }
+    id = LogId(snapshot.last_included_index(), snapshot.last_included_term());
+}
+
 int ConfigurationManager::add(const ConfigurationEntry& entry) {
     if (!_configurations.empty()) {
         if (_configurations.back().id.index >= entry.id.index) {

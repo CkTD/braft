@@ -28,6 +28,7 @@ struct ConfigurationEntry {
     Configuration old_conf;
 
     ConfigurationEntry() {}
+    ConfigurationEntry(const SnapshotMeta &snapshot);
     ConfigurationEntry(const LogEntry& entry) {
         id = entry.id;
         conf = *(entry.peers);
@@ -45,6 +46,23 @@ struct ConfigurationEntry {
     }
     bool contains(const PeerId& peer) const
     { return conf.contains(peer) || old_conf.contains(peer); }
+
+    SnapshotMeta ToSnapshotMeta() const {
+        SnapshotMeta meta;
+        meta.set_last_included_index(id.index);
+        meta.set_last_included_term(id.term);
+        for (Configuration::const_iterator
+                iter = conf.begin();
+                iter != conf.end(); ++iter) {
+            *meta.add_peers() = iter->to_string();
+        }
+        for (Configuration::const_iterator
+                iter = old_conf.begin();
+                iter != old_conf.end(); ++iter) {
+            *meta.add_old_peers() = iter->to_string();
+        }
+        return meta;
+    }
 };
 
 // Manager the history of configuration changing

@@ -80,7 +80,7 @@ bvar::Adder<int64_t> g_num_nodes("raft_node_count");
 static bvar::CounterRecorder g_apply_tasks_batch_counter(
         "raft_apply_tasks_batch_counter");
 
-int SnapshotTimer::adjust_timeout_ms(int timeout_ms) {
+int TruncateLogTimer::adjust_timeout_ms(int timeout_ms) {
     if (!_first_schedule) {
         return timeout_ms;
     }
@@ -160,7 +160,9 @@ NodeImpl::NodeImpl(const GroupId& group_id, const PeerId& peer_id)
     , _append_entries_cache(NULL)
     , _append_entries_cache_version(0)
     , _node_readonly(false)
-    , _majority_nodes_readonly(false) {
+    , _majority_nodes_readonly(false)
+    , _last_replicated_index(0)
+{
     butil::string_printf(&_v_group_id, "%s_%d", _group_id.c_str(), _server_id.idx);
     AddRef();
     g_num_nodes << 1;
@@ -186,7 +188,9 @@ NodeImpl::NodeImpl()
     , _append_entries_cache(NULL)
     , _append_entries_cache_version(0)
     , _node_readonly(false)
-    , _majority_nodes_readonly(false) {
+    , _majority_nodes_readonly(false)
+    , _last_replicated_index(0)
+{
     butil::string_printf(&_v_group_id, "%s_%d", _group_id.c_str(), _server_id.idx);
     AddRef();
     g_num_nodes << 1;
@@ -255,7 +259,6 @@ int NodeImpl::init_snapshot_storage() {
     opt.addr = _server_id.addr;
     opt.init_term = _current_term;
     opt.filter_before_copy_remote = _options.filter_before_copy_remote;
-    opt.usercode_in_pthread = _options.usercode_in_pthread;
     // not need to copy data file when it is witness.
     if (_options.witness) {
         opt.copy_file = false;
@@ -346,18 +349,46 @@ int NodeImpl::init_meta_storage() {
     return 0;
 }
 
-void NodeImpl::handle_snapshot_timeout() {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
 
-    // check state
-    if (!is_active_state(_state)) {
+void NodeImpl::handle_truncate_log_timeout() {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_state != STATE_LEADER && _state != STATE_FOLLOWER) {
         return;
     }
 
-    lck.unlock();
-    // TODO: do_snapshot in another thread to avoid blocking the timer thread.
-    do_snapshot(NULL);
+    // NOTE: Disable install snapshot temporarily when truncating log, since during 
+    //       installing snapshot, log and fsm may be reset, which is conflict with 
+    //       truncating log. If a snapshot is currently being insalled, just skip this
+    //       truncating, the log will be reset after installing success or cleared if
+    //       installing fail.
+    if (!_snapshot_executor->disable_install_snapshot()) {
+        LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                     << " skip truncate log since is installing snapshot";
+        return;
+    }
+    maybe_truncate_log();
+    _snapshot_executor->enable_install_snapshot();
+}
 
+void NodeImpl::maybe_truncate_log() {
+    if (_state == STATE_LEADER) {
+        int64_t last_replicated_index = _replicator_group.update_last_replicated_index();
+        if (last_replicated_index > _last_replicated_index) {
+            _last_replicated_index = last_replicated_index;
+        }
+    }
+
+    int64_t safe_applied_index, oldest_applied_index, first_index_kept;
+    _fsm_caller->get_and_update_recent_applied_indexes(&safe_applied_index, &oldest_applied_index);
+
+    if (_last_replicated_index >= oldest_applied_index) {
+        first_index_kept = 1U + std::min(safe_applied_index, _last_replicated_index);
+    } else {
+        first_index_kept = 1U + oldest_applied_index;
+        LOG(WARNING) << "group " << _group_id << " replicate log too slow, logs needed by peers may be truncated!";
+    }
+
+    _log_manager->truncate_prefix(first_index_kept);
 }
 
 int NodeImpl::init_fsm_caller(const LogId& bootstrap_id) {
@@ -452,19 +483,10 @@ int NodeImpl::bootstrap(const BootstrapOptions& options) {
     }
 
     if (options.last_log_index > 0) {
-        if (init_snapshot_storage() != 0) {
-            LOG(ERROR) << "Fail to init snapshot_storage from "
-                       << _options.snapshot_uri;
-            return -1;
-        }
-        SynchronizedClosure done;
-        _snapshot_executor->do_snapshot(&done);
-        done.wait();
-        if (!done.status().ok()) {
-            LOG(ERROR) << "Fail to save snapshot " << done.status()
-                       << " from " << _options.snapshot_uri;
-            return -1;
-        }
+        SnapshotMeta snapshot_meta;
+        snapshot_meta.set_last_included_index(boostrap_id.index);
+        snapshot_meta.set_last_included_term(boostrap_id.term);
+        _log_manager->reset(&snapshot_meta);
     }
     CHECK_EQ(_log_manager->first_log_index(), options.last_log_index + 1);
     CHECK_EQ(_log_manager->last_log_index(), options.last_log_index);
@@ -518,7 +540,7 @@ int NodeImpl::init(const NodeOptions& options) {
         CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
     }
     CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
-    CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
+    CHECK_EQ(0, _truncate_log_timer.init(this, options.min_log_retention_time_ms));
 
     _config_manager = new ConfigurationManager();
 
@@ -553,7 +575,7 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
-    if (init_fsm_caller(LogId(0, 0)) != 0) {
+    if (init_fsm_caller(_log_manager->last_snapshot_id()) != 0) {
         LOG(ERROR) << "node " << _group_id << ":" << _server_id
                    << " init_fsm_caller failed";
         return -1;
@@ -617,9 +639,7 @@ int NodeImpl::init(const NodeOptions& options) {
     rg_options.snapshot_throttle = _options.snapshot_throttle
         ? _options.snapshot_throttle->get()
         : NULL;
-    rg_options.snapshot_storage = _snapshot_executor
-        ? _snapshot_executor->snapshot_storage()
-        : NULL;
+    rg_options.snapshot_executor = _snapshot_executor;
     _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
 
     // set state to follower
@@ -632,10 +652,8 @@ int NodeImpl::init(const NodeOptions& options) {
               << " old_conf: " << _conf.old_conf;
 
     // start snapshot timer
-    if (_snapshot_executor && _options.snapshot_interval_s > 0) {
-        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
-                   << " term " << _current_term << " start snapshot_timer";
-        _snapshot_timer.start();
+    if (_snapshot_executor) {
+        _truncate_log_timer.start();
     }
 
     if (!_conf.empty()) {
@@ -967,21 +985,9 @@ butil::Status NodeImpl::reset_peers(const Configuration& new_peers) {
     return butil::Status::OK();
 }
 
-void NodeImpl::snapshot(Closure* done) {
-    do_snapshot(done);
-}
-
-void NodeImpl::do_snapshot(Closure* done) {
-    LOG(INFO) << "node " << _group_id << ":" << _server_id 
-              << " starts to do snapshot";
-    if (_snapshot_executor) {
-        _snapshot_executor->do_snapshot(done);
-    } else {
-        if (done) {
-            done->status().set_error(EINVAL, "Snapshot is not supported");
-            run_closure_in_bthread(done);
-        }
-    }
+int64_t NodeImpl::get_snapshot_index() {
+    BAIDU_SCOPED_LOCK(_mutex);
+    return _snapshot_executor->snapshot_storage()->get_index();
 }
 
 void NodeImpl::shutdown(Closure* done) {
@@ -1012,7 +1018,7 @@ void NodeImpl::shutdown(Closure* done) {
             _election_timer.destroy();
             _vote_timer.destroy();
             _stepdown_timer.destroy();
-            _snapshot_timer.destroy();
+            _truncate_log_timer.destroy();
 
             // stop replicator and fsm_caller wait
             if (_log_manager) {
@@ -1826,6 +1832,7 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
     // _conf_ctx.reset() will stop replicators of catching up nodes
     _conf_ctx.reset();
     _majority_nodes_readonly = false;
+    _last_replicated_index = 0;
 
     clear_append_entries_cache();
 
@@ -2515,6 +2522,9 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         response->set_term(_current_term);
         response->set_last_log_index(_log_manager->last_log_index());
         response->set_readonly(_node_readonly);
+        if (request->has_replicated_index() && request->replicated_index() > _last_replicated_index) {
+            _last_replicated_index = request->replicated_index();   
+        }
         lck.unlock();
         // see the comments at FollowerStableClosure::run()
         _ballot_box->set_last_committed_index(
@@ -2737,12 +2747,14 @@ void NodeImpl::describe(std::ostream& os, bool use_html) {
     _replicator_group.list_replicators(&replicators);
     const int64_t leader_timestamp = _follower_lease.last_leader_timestamp();
     const bool readonly = (_node_readonly || _majority_nodes_readonly);
+    const int64_t replicated_index = _last_replicated_index;
     lck.unlock();
     const char *newline = use_html ? "<br>" : "\r\n";
     os << "peer_id: " << _server_id << newline;
     os << "state: " << state2str(st) << newline;
     os << "readonly: " << readonly << newline;
     os << "term: " << term << newline;
+    os << "known_replicated_index: " << replicated_index << newline;
     os << "conf_index: " << conf_index << newline;
     os << "peers:";
     for (size_t j = 0; j < peers.size(); ++j) {
@@ -2818,8 +2830,8 @@ void NodeImpl::describe(std::ostream& os, bool use_html) {
     os << "stepdown_timer: ";
     _stepdown_timer.describe(os, use_html);
     os << newline;
-    os << "snapshot_timer: ";
-    _snapshot_timer.describe(os, use_html);
+    os << "truncate_log_timer: ";
+    _truncate_log_timer.describe(os, use_html);
     os << newline;
 
     _log_manager->describe(os, use_html);
@@ -3681,8 +3693,8 @@ void StepdownTimer::run() {
     _node->handle_stepdown_timeout();
 }
 
-void SnapshotTimer::run() {
-    _node->handle_snapshot_timeout();
+void TruncateLogTimer::run() {
+    _node->handle_truncate_log_timeout();
 }
 
 }  //  namespace braft

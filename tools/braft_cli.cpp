@@ -137,25 +137,6 @@ int reset_peer() {
     return 0;
 }
 
-int snapshot() {
-    CHECK_FLAG(peer);
-    CHECK_FLAG(group);
-    PeerId target_peer;
-    if (target_peer.parse(FLAGS_peer) != 0) {
-        LOG(ERROR) << "Fail to parse --peer=`" << FLAGS_peer<< '\'';
-        return -1;
-    }
-    CliOptions opt;
-    opt.timeout_ms = FLAGS_timeout_ms;
-    opt.max_retry = FLAGS_max_retry;
-    butil::Status st = snapshot(FLAGS_group, target_peer, opt);
-    if (!st.ok()) {
-        LOG(ERROR) << "Fail to make snapshot : " << st;
-        return -1;
-    }
-    return 0;
-}
-
 int transfer_leader() {
     CHECK_FLAG(conf);
     CHECK_FLAG(peer);
@@ -194,9 +175,6 @@ int run_command(const std::string& cmd) {
     if (cmd == "reset_peer") {
         return reset_peer();
     }
-    if (cmd == "snapshot") {
-        return snapshot();
-    }
     if (cmd == "transfer_leader") {
         return transfer_leader();
     }
@@ -226,7 +204,6 @@ int main(int argc , char* argv[]) {
                                        "--conf=$current_conf --new_peers=$new_peers\n"
                         "  reset_peer --group=$group_id "
                                      "--peer==$target_peer --new_peers=$new_peers\n"
-                        "  snapshot --group=$group_id --peer=$target_peer\n"
                         "  transfer_leader --group=$group_id --peer=$target_leader --conf=$current_conf\n",
                         proc_name);
     GFLAGS_NS::SetUsageMessage(help_str);

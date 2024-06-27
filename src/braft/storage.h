@@ -126,7 +126,7 @@ public:
     virtual ~LogStorage() {}
 
     // init logstorage, check consistency and integrity
-    virtual int init(ConfigurationManager* configuration_manager) = 0;
+    virtual int init(ConfigurationManager* configuration_manager, SnapshotMeta *snapshot_meta) = 0;
 
     // first log index in log
     virtual int64_t first_log_index() = 0;
@@ -146,15 +146,15 @@ public:
     // append entries to log and update IOMetric, return append success number 
     virtual int append_entries(const std::vector<LogEntry*>& entries, IOMetric* metric) = 0;
 
-    // delete logs from storage's head, [first_log_index, first_index_kept) will be discarded
-    virtual int truncate_prefix(const int64_t first_index_kept) = 0;
+    // delete logs from storage's head, [first_log_index, snapshot_meta.last_included_index()] will be discarded
+    virtual int truncate_prefix(const SnapshotMeta &snapshot_meta) = 0;
 
     // delete uncommitted logs from storage's tail, (last_index_kept, last_log_index] will be discarded
     virtual int truncate_suffix(const int64_t last_index_kept) = 0;
 
     // Drop all the existing logs and reset next log index to |next_log_index|.
     // This function is called after installing snapshot from leader
-    virtual int reset(const int64_t next_log_index) = 0;
+    virtual int reset(const SnapshotMeta &snapshot_meta) = 0;
 
     // Create an instance of this kind of LogStorage with the parameters encoded 
     // in |uri|
@@ -356,6 +356,11 @@ public:
         status.set_error(ENOSYS, "gc_instance interface is not implemented");
         return status;
     }
+
+    // Return current snapshot index, 0 is returned if not exists
+    virtual int64_t get_index() = 0;
+
+    virtual void describe(std::ostream& os, bool use_html) {};
 
     static butil::Status destroy(const std::string& uri);
 };

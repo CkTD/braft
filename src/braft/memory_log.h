@@ -40,9 +40,9 @@ public:
             : _first_log_index(1),
             _last_log_index(0) {}
 
-    virtual ~MemoryLogStorage() { reset(1); }
+    virtual ~MemoryLogStorage() { reset(SnapshotMeta()); }
 
-    virtual int init(ConfigurationManager* configuration_manager);
+    virtual int init(ConfigurationManager* configuration_manager, SnapshotMeta* snapshot_meta);
 
     // first log index in log
     virtual int64_t first_log_index() {
@@ -67,14 +67,14 @@ public:
     virtual int append_entries(const std::vector<LogEntry*>& entries, IOMetric* metric);
 
     // delete logs from storage's head, [first_log_index, first_index_kept) will be discarded
-    virtual int truncate_prefix(const int64_t first_index_kept);
+    virtual int truncate_prefix(const SnapshotMeta &snapshot_meta);
 
     // delete uncommitted logs from storage's tail, (last_index_kept, last_log_index] will be discarded
     virtual int truncate_suffix(const int64_t last_index_kept);
 
     // Drop all the existing logs and reset next log index to |next_log_index|.
     // This function is called after installing snapshot from leader
-    virtual int reset(const int64_t next_log_index);
+    virtual int reset(const SnapshotMeta &snapshot_meta);
 
     // Create an instance of this kind of LogStorage with the parameters encoded
     // in |uri|

@@ -490,12 +490,18 @@ struct NodeOptions {
     // Default: 1000 (1s)
     int max_clock_drift_ms;
 
-    // A snapshot saving would be triggered every |snapshot_interval_s| seconds
-    // if this was reset as a positive number
-    // If |snapshot_interval_s| <= 0, the time based snapshot would be disabled.
-    //
-    // Default: 3600 (1 hour)
-    int snapshot_interval_s;
+    // Min time before a log can be deleted after successfully being applied.
+    // Default: 600000 (10 min)
+    int min_log_retention_time_ms;
+
+    // Max time a log can be kept after successfully being applied, actual max time is 
+    // calculated by |min_log_retention_time_ms * max_log_retention_time_factor|.
+    // Note that in normal case, after a log has been applied more than min_log_retention_time_ms,
+    // it will be truncated if it has been replicated to all non-arbiter peers immediately,
+    // it won't be truncated if it hasn't been replicated to some non-arbiter peers until
+    // exceed time of this option.
+    // Default: 12 (2 hour)
+    int max_log_retention_time_factor;
 
     // We will regard a adding peer as caught up if the margin between the
     // last_log_index of this peer and the last_log_index of leader is less than
@@ -613,7 +619,8 @@ inline NodeOptions::NodeOptions()
     : election_timeout_ms(1000)
     , catchup_timeout_ms(0)
     , max_clock_drift_ms(1000)
-    , snapshot_interval_s(3600)
+    , min_log_retention_time_ms(600000)
+    , max_log_retention_time_factor(12)
     , catchup_margin(1000)
     , usercode_in_pthread(false)
     , fsm(NULL)
@@ -708,9 +715,12 @@ public:
     // case, BE CAREFULE when dealing with this method.
     butil::Status reset_peers(const Configuration& new_peers);
 
-    // Start a snapshot immediately if possible. done->Run() would be invoked
-    // when the snapshot finishes, describing the detailed result.
-    void snapshot(Closure* done);
+    // Get current snapshot index.
+    // Return 0 if snapshot does not exists.
+    // Return a positive value means:
+    //   for leader, it is installing snapshot to follower(s)
+    //   for follower, it is loading snapshot from leader
+    int64_t get_snapshot_index();
 
     // user trigger vote
     // reset election_timeout, suggest some peer to become the leader in a

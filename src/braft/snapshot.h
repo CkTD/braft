@@ -200,6 +200,8 @@ public:
     virtual int set_filter_before_copy_remote();
     virtual int set_file_system_adaptor(FileSystemAdaptor* fs);
     virtual int set_snapshot_throttle(SnapshotThrottle* snapshot_throttle);
+    virtual void describe(std::ostream& os, bool use_html);
+    virtual int64_t get_index();
 
     SnapshotStorage* new_instance(const std::string& uri) const;
     butil::Status gc_instance(const std::string& uri) const;
@@ -211,14 +213,14 @@ private:
     SnapshotWriter* create(bool from_empty) WARN_UNUSED_RESULT;
     int destroy_snapshot(const std::string& path);
     int close(SnapshotWriter* writer, bool keep_data_on_error);
-    void ref(const int64_t index);
-    void unref(const int64_t index);
+    void ref();
+    void unref();
 
     raft_mutex_t _mutex;
     std::string _path;
     bool _filter_before_copy_remote;
-    int64_t _last_snapshot_index;
-    std::map<int64_t, int> _ref_map;
+    int64_t _snapshot_index;
+    int _ref_cnt;
     butil::EndPoint _addr;
     bool _copy_file = true;
     scoped_refptr<FileSystemAdaptor> _fs;

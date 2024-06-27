@@ -173,28 +173,6 @@ butil::Status reset_peer(const GroupId& group_id, const PeerId& peer_id,
     return butil::Status::OK();
 }
 
-butil::Status snapshot(const GroupId& group_id, const PeerId& peer_id,
-                      const CliOptions& options) {
-    brpc::Channel channel;
-    if (channel.Init(peer_id.addr, NULL) != 0) {
-        return butil::Status(-1, "Fail to init channel to %s",
-                                peer_id.to_string().c_str());
-    }
-    brpc::Controller cntl;
-    cntl.set_timeout_ms(options.timeout_ms);
-    cntl.set_max_retry(options.max_retry);
-    SnapshotRequest request;
-    request.set_group_id(group_id);
-    request.set_peer_id(peer_id.to_string());
-    SnapshotResponse response;
-    CliService_Stub stub(&channel);
-    stub.snapshot(&cntl, &request, &response, NULL);
-    if (cntl.Failed()) {
-        return butil::Status(cntl.ErrorCode(), cntl.ErrorText());
-    }
-    return butil::Status::OK();
-}
-
 butil::Status change_peers(const GroupId& group_id, const Configuration& conf,
                            const Configuration& new_peers,
                            const CliOptions& options) {

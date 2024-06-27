@@ -22,7 +22,7 @@
 #include <bthread/bthread.h>                            // bthread_id
 #include <brpc/channel.h>                  // brpc::Channel
 
-#include "braft/storage.h"                       // SnapshotStorage
+#include "braft/snapshot_executor.h"             // SnapshotExecutor
 #include "braft/raft.h"                          // Closure
 #include "braft/configuration.h"                 // Configuration
 #include "braft/raft.pb.h"                       // AppendEntriesRequest
@@ -39,8 +39,9 @@ class SnapshotThrottle;
 // the lock contention between Replicator and NodeImpl.
 struct ReplicatorStatus : public butil::RefCountedThreadSafe<ReplicatorStatus> {
     butil::atomic<int64_t> last_rpc_send_timestamp;
+    butil::atomic<int64_t> last_replicated_index;
 
-    ReplicatorStatus() : last_rpc_send_timestamp(0) {}
+    ReplicatorStatus() : last_rpc_send_timestamp(0), last_replicated_index(0) {}
 };
 
 struct ReplicatorOptions {
@@ -54,7 +55,7 @@ struct ReplicatorOptions {
     BallotBox* ballot_box;
     NodeImpl *node;
     int64_t term;
-    SnapshotStorage* snapshot_storage;
+    SnapshotExecutor* snapshot_executor;
     SnapshotThrottle* snapshot_throttle;
     ReplicatorStatus* replicator_status;
 };
@@ -129,6 +130,8 @@ public:
     static bool readonly(ReplicatorId id);
     
 private:
+    friend class OnDemandSnapshotDone;
+
     enum St {
         IDLE,
         BLOCKING,
@@ -159,6 +162,7 @@ private:
                             bool is_heartbeat);
     void _block(long start_time_us, int error_code);
     void _install_snapshot();
+    void _continue_install_snapshot(butil::Status status, SnapshotReader *reader);
     void _start_heartbeat_timer(long start_time_us);
     void _send_timeout_now(bool unlock_id, bool old_leader_stepped_down,
                            int timeout_ms = -1);
@@ -229,6 +233,9 @@ private:
                 .store(new_timestamp, butil::memory_order_relaxed);
         }
     }
+    int64_t _last_replicated_index() {
+        return _options.replicator_status->last_replicated_index.load(butil::memory_order_relaxed);
+    }
 
 private:
     struct FlyingAppendEntriesRpc {
@@ -270,7 +277,7 @@ struct ReplicatorGroupOptions {
     LogManager* log_manager;
     BallotBox* ballot_box;
     NodeImpl* node;
-    SnapshotStorage* snapshot_storage;
+    SnapshotExecutor* snapshot_executor;
     SnapshotThrottle* snapshot_throttle;
 };
 
@@ -348,6 +355,14 @@ public:
     // -1 otherwise.
     int find_the_next_candidate(PeerId* peer_id,
                                 const ConfigurationEntry& conf);
+
+    // Update index of log that has been replicated to all peers
+    // Returns updated last_replicated_index
+    // 0 is returned in following cases:
+    //  - no logs has been replicated or
+    //  - some peer is alive but we don't know which log has been replicated to it
+    // INT64_MAX - 1 is returned if this is leader of one node group
+    int64_t update_last_replicated_index();
 
     // List all the existing replicators
     void list_replicators(std::vector<ReplicatorId>* out) const;

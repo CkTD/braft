@@ -11,7 +11,10 @@ message ConfigurationPBMeta {
 };
 
 message LogPBMeta {
+    // first_log_index is deprecated,
+    // and is always equals to snapshot.last_included_index() + 1
     required int64 first_log_index = 1;
+    optional SnapshotMeta snapshot = 2;
 };
 
 message StablePBMeta {

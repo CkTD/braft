@@ -37,10 +37,6 @@ public:
                     const ::braft::ResetPeerRequest* request,
                     ::braft::ResetPeerResponse* response,
                     ::google::protobuf::Closure* done);
-    void snapshot(::google::protobuf::RpcController* controller,
-                  const ::braft::SnapshotRequest* request,
-                  ::braft::SnapshotResponse* response,
-                  ::google::protobuf::Closure* done);
     void get_leader(::google::protobuf::RpcController* controller,
                     const ::braft::GetLeaderRequest* request,
                     ::braft::GetLeaderResponse* response,

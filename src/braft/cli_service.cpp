@@ -163,34 +163,6 @@ void CliServiceImpl::reset_peer(::google::protobuf::RpcController* controller,
     }
 }
 
-static void snapshot_returned(brpc::Controller* cntl,
-                              scoped_refptr<NodeImpl> node,
-                              ::google::protobuf::Closure* done,
-                              const butil::Status& st) {
-    brpc::ClosureGuard done_guard(done);
-    if (!st.ok()) {
-        cntl->SetFailed(st.error_code(), "%s", st.error_cstr());
-    }
-}
-
-void CliServiceImpl::snapshot(::google::protobuf::RpcController* controller,
-                              const ::braft::SnapshotRequest* request,
-                              ::braft::SnapshotResponse* response,
-                              ::google::protobuf::Closure* done) {
-
-    brpc::Controller* cntl = (brpc::Controller*)controller;
-    brpc::ClosureGuard done_guard(done);
-    scoped_refptr<NodeImpl> node;
-    butil::Status st = get_node(&node, request->group_id(), request->peer_id());
-    if (!st.ok()) {
-        cntl->SetFailed(st.error_code(), "%s", st.error_cstr());
-        return;
-    }
-    Closure* snapshot_done = NewCallback(snapshot_returned, cntl, node,
-                                         done_guard.release());
-    return node->snapshot(snapshot_done);
-}
-
 void CliServiceImpl::get_leader(::google::protobuf::RpcController* controller,
                                 const ::braft::GetLeaderRequest* request,
                                 ::braft::GetLeaderResponse* response,

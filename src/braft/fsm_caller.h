@@ -19,6 +19,7 @@
 #ifndef  BRAFT_FSM_CALLER_H
 #define  BRAFT_FSM_CALLER_H
 
+#include <queue>
 #include <butil/macros.h>                        // BAIDU_CACHELINE_ALIGNMENT
 #include <bthread/bthread.h>
 #include <bthread/execution_queue.h>
@@ -81,6 +82,7 @@ struct FSMCallerOptions {
         , node(NULL)
         , usercode_in_pthread(false)
         , bootstrap_id()
+        , index_queue_size(12)
     {}
     LogManager *log_manager;
     StateMachine *fsm;
@@ -89,6 +91,7 @@ struct FSMCallerOptions {
     NodeImpl* node;
     bool usercode_in_pthread;
     LogId bootstrap_id;
+    size_t index_queue_size;
 };
 
 class SaveSnapshotClosure : public Closure {
@@ -123,6 +126,7 @@ public:
     int64_t applying_index() const;
     void describe(std::ostream& os, bool use_html);
     void join();
+    void get_and_update_recent_applied_indexes(int64_t *prev_applied_index, int64_t *oldest_applied_index);
 private:
 
 friend class IteratorImpl;
@@ -195,6 +199,8 @@ friend class IteratorImpl;
     butil::atomic<int64_t> _applying_index;
     Error _error;
     bool _queue_started;
+    std::queue<int64_t> _recent_applied_indexes;
+    size_t _recent_applied_indexes_size;
 };
 
 };
