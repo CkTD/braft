@@ -1,6 +1,11 @@
-[![Build Status](https://travis-ci.org/baidu/braft.svg?branch=master)](https://travis-ci.org/baidu/braft)
+# Overriew
+This is a fork from baidu/braft. Some features are added or changed for large-scale distributed storage systems.
 
----
+- The snapshot protocol is changed to on-demand mode. The original braft from Baidu assumes that the FSM (finite state machine) is volatile, so it maintains at least one full snapshot at all times, which is used to recover the FSM if the system restarts. However, in the real world, the FSM is more likely a persistent storage engine, e.g., RocksDB, so it is unnecessary for Raft to keep snapshots, and the initialization phase doesn't need a snapshot. When Raft finds it needs to send a snapshot to a slow peer, the snapshot is taken on demand and destroyed after use. This change reduces space amplification, which is very helpful for storage systems. Since the snapshot protocol is changed, the old code is broken because their FSM may rely on the snapshot kept in Raft for recovery during the initialization phase. This is also the main reason why I created a new repository.
+
+- A new MergedLogStorage is added for the efficiency of multi-raft. All nodes on a single server can share a single log stream, which is very useful to avoid random writes when you have lots of Raft nodes on one single server and serve a high TPS (transactions per second).
+
+- A new arbiter role is added to reduce costs. Compared to the witness support in the original Braft from Baidu, when the system is functioning normally, the arbiter node only handles heartbeats and does not require append entries. The arbiter have even lower cost(lower cpu and network use) and avoid the problem faced by the witness, which needs to temporarily become the leader.
 
 # Overview
 An industrial-grade C++ implementation of [RAFT consensus algorithm](https://raft.github.io/) and [replicated state machine](https://en.wikipedia.org/wiki/State_machine_replication) based on [brpc](https://github.com/brpc/brpc). braft is designed and implemented for scenarios demanding for high workload and low overhead of latency, with the consideration for easy-to-understand concepts so that engineers inside Baidu can build their own distributed systems individually and correctly.
