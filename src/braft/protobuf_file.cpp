@@ -114,7 +114,10 @@ int ProtoBufFile::load(google::protobuf::Message* message) {
 
     // parse msg
     butil::IOBufAsZeroCopyInputStream msg_wrapper(msg_buf);
-    message->ParseFromZeroCopyStream(&msg_wrapper);
+    if(!message->ParseFromZeroCopyStream(&msg_wrapper)) {
+        LOG(WARNING) << "parse protobuf failed, path: " << _path;
+        return -1;
+    }
 
     return 0;
 }
